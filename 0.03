@@ -1,0 +1,192 @@
+use solana_program::{
+    account_info::{next_account_info, AccountInfo},
+    entrypoint,
+    entrypoint::ProgramResult,
+    program_error::ProgramError,
+    pubkey::Pubkey,
+    msg,
+    clock::Clock,
+    sysvar::{Sysvar, clock::Clock, rent::Rent},
+};
+use spl_token::{
+    instruction::{initialize_mint, mint_to, transfer},
+    state::{Account as TokenAccount, Mint},
+};
+use chrono::NaiveDateTime;
+use std::collections::HashMap;
+use std::str::FromStr;
+
+#[repr(u32)]
+#[derive(Debug, PartialEq)]
+pub enum CustomError {
+    NotFirstOfMonth = 1,
+    InsufficientAccounts = 2,
+    InvalidDestinationAccount = 3,
+    InsufficientTreasuryBalance = 4,
+    UnauthorizedAuthority = 5,
+    AccountNotRentExempt = 6,
+    InvalidVote = 7,
+    MultiSigApprovalFailed = 8,
+}
+
+impl From<CustomError> for ProgramError {
+    fn from(e: CustomError) -> Self {
+        ProgramError::Custom(e as u32)
+    }
+}
+
+entrypoint!(process_instruction);
+
+pub fn process_instruction(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    instruction_data: &[u8],
+) -> ProgramResult {
+    let mut accounts_iter = accounts.iter();
+
+    // Parse accounts
+    let authority = next_account_info(&mut accounts_iter)?;
+    let token_mint = next_account_info(&mut accounts_iter)?;
+    let source_account = next_account_info(&mut accounts_iter)?;
+    let automated_wallet = next_account_info(&mut accounts_iter)?;
+    let dest_accounts: Vec<&AccountInfo> = accounts_iter.collect();
+    let token_program = next_account_info(&mut accounts_iter)?;
+
+    // Validate authority
+    validate_authority(authority)?;
+
+    if token_program.key != &spl_token::id() {
+        msg!("Incorrect token program ID.");
+        return Err(ProgramError::IncorrectProgramId);
+    }
+
+    if instruction_data.is_empty() {
+        initialize_mint_logic(token_program, token_mint, automated_wallet)?;
+        return Ok(());
+    }
+
+    validate_dest_accounts(&dest_accounts)?;
+    validate_source_account(source_account, token_mint)?;
+    validate_rent_exemption(source_account, &dest_accounts)?;
+    validate_distribution_day()?;
+
+    distribute_tokens(token_mint, source_account, automated_wallet, &dest_accounts)?;
+    msg!("Tokens successfully distributed to all accounts based on wealth classes.");
+    Ok(())
+}
+
+fn governance_vote(voter: &AccountInfo, proposal_id: u64, votes: &mut HashMap<u64, u64>) -> ProgramResult {
+    if !voter.is_signer {
+        msg!("Voter must sign the transaction.");
+        return Err(CustomError::InvalidVote.into());
+    }
+    
+    let vote_count = votes.entry(proposal_id).or_insert(0);
+    *vote_count += 1;
+
+    msg!("Vote recorded for proposal {} by voter {}", proposal_id, voter.key);
+    Ok(())
+}
+
+fn validate_authority(authority: &AccountInfo) -> ProgramResult {
+    let expected_authority_pubkey = Pubkey::from_str("5qBautrEBLiBczdb2fpJbN3RcpYzVQ4FMmMEMNeivUFA").unwrap();
+    if !authority.is_signer || authority.key != &expected_authority_pubkey {
+        msg!("Unauthorized authority account.");
+        return Err(CustomError::UnauthorizedAuthority.into());
+    }
+    Ok(())
+}
+
+fn multi_sig_approval(signers: &[&AccountInfo], threshold: usize) -> ProgramResult {
+    let approved_count = signers.iter().filter(|s| s.is_signer).count();
+    
+    if approved_count < threshold {
+        msg!("Multi-signature approval failed: {}/{} signers approved.", approved_count, threshold);
+        return Err(CustomError::MultiSigApprovalFailed.into());
+    }
+
+    msg!("Multi-signature approval successful: {}/{} signers approved.", approved_count, threshold);
+    Ok(())
+}
+
+fn initialize_mint_logic(token_program: &AccountInfo, token_mint: &AccountInfo, automated_wallet: &AccountInfo) -> ProgramResult {
+    let decimals: u8 = 6;
+    let mint_authority = automated_wallet.key;
+    let freeze_authority = None;
+
+    let init_mint_ix = initialize_mint(
+        &spl_token::id(),
+        token_mint.key,
+        mint_authority,
+        freeze_authority,
+        decimals,
+    )?;
+
+    solana_program::program::invoke(
+        &init_mint_ix,
+        &[token_mint.clone(), automated_wallet.clone(), token_program.clone()]
+    )?;
+
+    let total_supply: u64 = 1_000_000_000 * 10_u64.pow(decimals as u32);
+
+    let mint_to_ix = mint_to(
+        &spl_token::id(),
+        token_mint.key,
+        automated_wallet.key,
+        automated_wallet.key,
+        &[],
+        total_supply,
+    )?;
+
+    solana_program::program::invoke(
+        &mint_to_ix,
+        &[token_mint.clone(), automated_wallet.clone(), token_program.clone()]
+    )?;
+
+    msg!("Token mint initialized successfully, and total supply minted to the automated wallet.");
+    Ok(())
+}
+
+fn validate_dest_accounts(dest_accounts: &[&AccountInfo]) -> ProgramResult {
+    if dest_accounts.is_empty() || dest_accounts.len() < 5 {
+        msg!("Insufficient destination accounts to distribute tokens.");
+        return Err(CustomError::InsufficientAccounts.into());
+    }
+    Ok(())
+}
+
+fn validate_source_account(source_account: &AccountInfo, token_mint: &AccountInfo) -> ProgramResult {
+    let source_account_info = TokenAccount::unpack(&source_account.try_borrow_data()?)?;
+    if source_account_info.mint != *token_mint.key {
+        msg!("Source account mint does not match the token mint.");
+        return Err(ProgramError::InvalidArgument);
+    }
+    Ok(())
+}
+
+fn validate_rent_exemption(source_account: &AccountInfo, dest_accounts: &[&AccountInfo]) -> ProgramResult {
+    let rent = Rent::get()?;
+    if !rent.is_exempt(source_account.lamports(), source_account.data_len()) {
+        msg!("Source account is not rent-exempt.");
+        return Err(CustomError::AccountNotRentExempt.into());
+    }
+    for dest_account in dest_accounts {
+        if !rent.is_exempt(dest_account.lamports(), dest_account.data_len()) {
+            msg!("Destination account is not rent-exempt.");
+            return Err(CustomError::AccountNotRentExempt.into());
+        }
+    }
+    Ok(())
+}
+
+fn validate_distribution_day() -> ProgramResult {
+    let clock = Clock::get()?;
+    let current_time = NaiveDateTime::from_timestamp_opt(clock.unix_timestamp, 0)
+        .ok_or(ProgramError::InvalidArgument)?;
+    let day_of_month = current_time.day();
+    if day_of_month != 1 {
+        msg!("Token distribution can only be executed on the 1st of the month.");
+        return Err(CustomError::NotFirstOfMonth.into());
+    }
+    Ok(())
+}
